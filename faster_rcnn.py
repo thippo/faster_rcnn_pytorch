@@ -3,11 +3,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
 
 from utils.timer import Timer
 from utils.blob import im_list_to_blob
-from fast_rcnn.nms_wrapper import nms
+from py_cpu_nms import nms
 from rpn_msr.proposal_layer import proposal_layer as proposal_layer_py
 from rpn_msr.anchor_target_layer import anchor_target_layer as anchor_target_layer_py
 from rpn_msr.proposal_target_layer import proposal_target_layer as proposal_target_layer_py
@@ -15,9 +14,7 @@ from fast_rcnn.bbox_transform import bbox_transform_inv, clip_boxes
 
 import network
 from network import Conv2d, FC
-# from roi_pooling.modules.roi_pool_py import RoIPool
-from roi_pooling.modules.roi_pool import RoIPool
-from vgg16 import VGG16
+from resnet import resnet50
 
 
 def nms_detections(pred_boxes, scores, nms_thresh, inds=None):
@@ -28,6 +25,40 @@ def nms_detections(pred_boxes, scores, nms_thresh, inds=None):
         return pred_boxes[keep], scores[keep]
     return pred_boxes[keep], scores[keep], inds[keep]
 
+class ROIpooling(nn.Module):
+
+    def __init__(self, size=(7, 7), spatial_scale=1.0 / 16.0):
+        super(ROIpooling, self).__init__()
+        self.adapmax2d = nn.AdaptiveMaxPool2d(size)
+        self.spatial_scale = spatial_scale
+
+    def forward(self, features, rois_boxes):
+
+        # rois_boxes : [x, y, x`, y`]
+
+        if type(rois_boxes) == np.ndarray:
+            rois_boxes = to_var(torch.from_numpy(rois_boxes))
+
+        rois_boxes = rois_boxes.data.float().clone()
+        rois_boxes.mul_(self.spatial_scale)
+        rois_boxes = rois_boxes.long()
+
+        output = []
+
+        for i in range(rois_boxes.size(0)):
+            roi = rois_boxes[i]
+
+            try:
+
+                roi_feature = features[:, :, roi[1]:(roi[3] + 1), roi[0]:(roi[2] + 1)]
+            except Exception as e:
+                print(e, roi)
+
+
+            pool_feature = self.adapmax2d(roi_feature)
+            output.append(pool_feature)
+
+        return torch.cat(output, 0)
 
 class RPN(nn.Module):
     _feat_stride = [16, ]
@@ -36,7 +67,7 @@ class RPN(nn.Module):
     def __init__(self):
         super(RPN, self).__init__()
 
-        self.features = VGG16(bn=False)
+        self.features = resnet50()
         self.conv1 = Conv2d(512, 512, 3, same_padding=True)
         self.score_conv = Conv2d(512, len(self.anchor_scales) * 3 * 2, 1, relu=False, same_padding=False)
         self.bbox_conv = Conv2d(512, len(self.anchor_scales) * 3 * 4, 1, relu=False, same_padding=False)
@@ -49,18 +80,19 @@ class RPN(nn.Module):
     def loss(self):
         return self.cross_entropy + self.loss_box * 10
 
-    def forward(self, im_data, im_info, gt_boxes=None, gt_ishard=None, dontcare_areas=None):
-        im_data = network.np_to_variable(im_data, is_cuda=True)
+    def forward(self, im_data, im_info, gt_boxes=None):
         im_data = im_data.permute(0, 3, 1, 2)
         features = self.features(im_data)
+        height, width = features.size()[-2:]
 
         rpn_conv1 = self.conv1(features)
 
         # rpn score
         rpn_cls_score = self.score_conv(rpn_conv1)
-        rpn_cls_score_reshape = self.reshape_layer(rpn_cls_score, 2)
+        rpn_cls_score = rpn_cls_score.squeeze(0).permute(1, 2, 0).contiguous().view(-1, 2)
         rpn_cls_prob = F.softmax(rpn_cls_score_reshape)
-        rpn_cls_prob_reshape = self.reshape_layer(rpn_cls_prob, len(self.anchor_scales)*3*2)
+        rpn_cls_prob = rpn_cls_prob.view(height, width, 18)
+        rpn_cls_prob = rpn_cls_prob.permute(2, 0, 1).contiguous().unsqueeze(0)
 
         # rpn boxes
         rpn_bbox_pred = self.bbox_conv(rpn_conv1)
@@ -73,7 +105,7 @@ class RPN(nn.Module):
         # generating training labels and build the rpn loss
         if self.training:
             assert gt_boxes is not None
-            rpn_data = self.anchor_target_layer(rpn_cls_score, gt_boxes, gt_ishard, dontcare_areas,
+            rpn_data = self.anchor_target_layer(rpn_cls_score, gt_boxes,
                                                 im_info, self._feat_stride, self.anchor_scales)
             self.cross_entropy, self.loss_box = self.build_loss(rpn_cls_score_reshape, rpn_bbox_pred, rpn_data)
 
@@ -101,19 +133,6 @@ class RPN(nn.Module):
 
         return rpn_cross_entropy, rpn_loss_box
 
-    @staticmethod
-    def reshape_layer(x, d):
-        input_shape = x.size()
-        # x = x.permute(0, 3, 1, 2)
-        # b c w h
-        x = x.view(
-            input_shape[0],
-            int(d),
-            int(float(input_shape[1] * input_shape[2]) / float(d)),
-            input_shape[3]
-        )
-        # x = x.permute(0, 2, 3, 1)
-        return x
 
     @staticmethod
     def proposal_layer(rpn_cls_prob_reshape, rpn_bbox_pred, im_info, cfg_key, _feat_stride, anchor_scales):
@@ -124,7 +143,7 @@ class RPN(nn.Module):
         return x.view(-1, 5)
 
     @staticmethod
-    def anchor_target_layer(rpn_cls_score, gt_boxes, gt_ishard, dontcare_areas, im_info, _feat_stride, anchor_scales):
+    def anchor_target_layer(rpn_cls_score, gt_boxes, im_info, _feat_stride, anchor_scales):
         """
         rpn_cls_score: for pytorch (1, Ax2, H, W) bg/fg scores of previous conv layer
         gt_boxes: (G, 5) vstack of [x1, y1, x2, y2, class]
@@ -154,43 +173,16 @@ class RPN(nn.Module):
 
         return rpn_labels, rpn_bbox_targets, rpn_bbox_inside_weights, rpn_bbox_outside_weights
 
-    def load_from_npz(self, params):
-        # params = np.load(npz_file)
-        self.features.load_from_npz(params)
-
-        pairs = {'conv1.conv': 'rpn_conv/3x3', 'score_conv.conv': 'rpn_cls_score', 'bbox_conv.conv': 'rpn_bbox_pred'}
-        own_dict = self.state_dict()
-        for k, v in pairs.items():
-            key = '{}.weight'.format(k)
-            param = torch.from_numpy(params['{}/weights:0'.format(v)]).permute(3, 2, 0, 1)
-            own_dict[key].copy_(param)
-
-            key = '{}.bias'.format(k)
-            param = torch.from_numpy(params['{}/biases:0'.format(v)])
-            own_dict[key].copy_(param)
-
-
 class FasterRCNN(nn.Module):
-    n_classes = 21
-    classes = np.asarray(['__background__',
-                       'aeroplane', 'bicycle', 'bird', 'boat',
-                       'bottle', 'bus', 'car', 'cat', 'chair',
-                       'cow', 'diningtable', 'dog', 'horse',
-                       'motorbike', 'person', 'pottedplant',
-                       'sheep', 'sofa', 'train', 'tvmonitor'])
-    PIXEL_MEANS = np.array([[[102.9801, 115.9465, 122.7717]]])
-    SCALES = (600,)
-    MAX_SIZE = 1000
 
     def __init__(self, classes=None, debug=False):
         super(FasterRCNN, self).__init__()
 
-        if classes is not None:
-            self.classes = classes
-            self.n_classes = len(classes)
+        self.classes = classes
+        self.n_classes = len(classes)
 
         self.rpn = RPN()
-        self.roi_pool = RoIPool(7, 7, 1.0/16)
+        self.roi_pool = ROIpooling((7, 7), 1.0/16)
         self.fc6 = FC(512 * 7 * 7, 4096)
         self.fc7 = FC(4096, 4096)
         self.score_fc = FC(4096, self.n_classes, relu=False)
@@ -205,17 +197,13 @@ class FasterRCNN(nn.Module):
 
     @property
     def loss(self):
-        # print self.cross_entropy
-        # print self.loss_box
-        # print self.rpn.cross_entropy
-        # print self.rpn.loss_box
         return self.cross_entropy + self.loss_box * 10
 
-    def forward(self, im_data, im_info, gt_boxes=None, gt_ishard=None, dontcare_areas=None):
-        features, rois = self.rpn(im_data, im_info, gt_boxes, gt_ishard, dontcare_areas)
+    def forward(self, im_data, im_info, gt_boxes=None):
+        features, rois = self.rpn(im_data, im_info, gt_boxes)
 
         if self.training:
-            roi_data = self.proposal_target_layer(rois, gt_boxes, gt_ishard, dontcare_areas, self.n_classes)
+            roi_data = self.proposal_target_layer(rois, gt_boxes, self.n_classes)
             rois = roi_data[0]
 
         # roi pool
@@ -264,7 +252,7 @@ class FasterRCNN(nn.Module):
         return cross_entropy, loss_box
 
     @staticmethod
-    def proposal_target_layer(rpn_rois, gt_boxes, gt_ishard, dontcare_areas, num_classes):
+    def proposal_target_layer(rpn_rois, gt_boxes, num_classes):
         """
         ----------
         rpn_rois:  (1 x H x W x A, 5) [0, x1, y1, x2, y2]
@@ -283,7 +271,7 @@ class FasterRCNN(nn.Module):
         """
         rpn_rois = rpn_rois.data.cpu().numpy()
         rois, labels, bbox_targets, bbox_inside_weights, bbox_outside_weights = \
-            proposal_target_layer_py(rpn_rois, gt_boxes, gt_ishard, dontcare_areas, num_classes)
+            proposal_target_layer_py(rpn_rois, gt_boxes, num_classes)
         # print labels.shape, bbox_targets.shape, bbox_inside_weights.shape
         rois = network.np_to_variable(rois, is_cuda=True)
         labels = network.np_to_variable(labels, is_cuda=True, dtype=torch.LongTensor)
@@ -373,18 +361,3 @@ class FasterRCNN(nn.Module):
         blob = im_list_to_blob(processed_ims)
 
         return blob, np.array(im_scale_factors)
-
-    def load_from_npz(self, params):
-        self.rpn.load_from_npz(params)
-
-        pairs = {'fc6.fc': 'fc6', 'fc7.fc': 'fc7', 'score_fc.fc': 'cls_score', 'bbox_fc.fc': 'bbox_pred'}
-        own_dict = self.state_dict()
-        for k, v in pairs.items():
-            key = '{}.weight'.format(k)
-            param = torch.from_numpy(params['{}/weights:0'.format(v)]).permute(1, 0)
-            own_dict[key].copy_(param)
-
-            key = '{}.bias'.format(k)
-            param = torch.from_numpy(params['{}/biases:0'.format(v)])
-            own_dict[key].copy_(param)
-

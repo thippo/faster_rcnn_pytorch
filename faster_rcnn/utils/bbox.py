@@ -5,20 +5,11 @@
 # Written by Sergey Karayev
 # --------------------------------------------------------
 
-cimport cython
 import numpy as np
-cimport numpy as np
 
 DTYPE = np.float
-ctypedef np.float_t DTYPE_t
 
-def bbox_overlaps(np.ndarray[DTYPE_t, ndim=2] boxes,
-        np.ndarray[DTYPE_t, ndim=2] query_boxes):
-    return bbox_overlaps_c(boxes, query_boxes)
-
-cdef np.ndarray[DTYPE_t, ndim=2] bbox_overlaps_c(
-        np.ndarray[DTYPE_t, ndim=2] boxes,
-        np.ndarray[DTYPE_t, ndim=2] query_boxes):
+def bbox_overlaps(boxes, query_boxes):
     """
     Parameters
     ----------
@@ -28,12 +19,9 @@ cdef np.ndarray[DTYPE_t, ndim=2] bbox_overlaps_c(
     -------
     overlaps: (N, K) ndarray of overlap between boxes and query_boxes
     """
-    cdef unsigned int N = boxes.shape[0]
-    cdef unsigned int K = query_boxes.shape[0]
-    cdef np.ndarray[DTYPE_t, ndim=2] overlaps = np.zeros((N, K), dtype=DTYPE)
-    cdef DTYPE_t iw, ih, box_area
-    cdef DTYPE_t ua
-    cdef unsigned int k, n
+    N = boxes.shape[0]
+    K = query_boxes.shape[0]
+    overlaps = np.zeros((N, K), dtype=DTYPE)
     for k in range(K):
         box_area = (
             (query_boxes[k, 2] - query_boxes[k, 0] + 1) *
@@ -59,15 +47,7 @@ cdef np.ndarray[DTYPE_t, ndim=2] bbox_overlaps_c(
     return overlaps
 
 
-def bbox_intersections(
-        np.ndarray[DTYPE_t, ndim=2] boxes,
-        np.ndarray[DTYPE_t, ndim=2] query_boxes):
-    return bbox_intersections_c(boxes, query_boxes)
-
-
-cdef np.ndarray[DTYPE_t, ndim=2] bbox_intersections_c(
-        np.ndarray[DTYPE_t, ndim=2] boxes,
-        np.ndarray[DTYPE_t, ndim=2] query_boxes):
+def bbox_intersections(boxes, query_boxes):
     """
     For each query box compute the intersection ratio covered by boxes
     ----------
@@ -79,12 +59,9 @@ cdef np.ndarray[DTYPE_t, ndim=2] bbox_intersections_c(
     -------
     overlaps: (N, K) ndarray of intersec between boxes and query_boxes
     """
-    cdef unsigned int N = boxes.shape[0]
-    cdef unsigned int K = query_boxes.shape[0]
-    cdef np.ndarray[DTYPE_t, ndim=2] intersec = np.zeros((N, K), dtype=DTYPE)
-    cdef DTYPE_t iw, ih, box_area
-    cdef DTYPE_t ua
-    cdef unsigned int k, n
+    N = boxes.shape[0]
+    K = query_boxes.shape[0]
+    intersec = np.zeros((N, K), dtype=DTYPE)
     for k in range(K):
         box_area = (
             (query_boxes[k, 2] - query_boxes[k, 0] + 1) *

@@ -7,7 +7,7 @@
 
 import numpy as np
 
-def py_cpu_nms(dets, thresh):
+def nms(dets, thresh):
     """Pure Python NMS baseline."""
     x1 = dets[:, 0]
     y1 = dets[:, 1]

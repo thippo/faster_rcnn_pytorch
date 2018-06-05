@@ -1,15 +1,15 @@
 import os
 import torch
+from torch.utils.data import DataLoader
 import numpy as np
 from datetime import datetime
 
-from faster_rcnn import network
-from faster_rcnn.faster_rcnn import FasterRCNN, RPN
-from faster_rcnn.utils.timer import Timer
+from packages.models import network
+from packages.models.faster_rcnn import FasterRCNN, RPN
+from packages.utils.timer import Timer
 
-import faster_rcnn.roi_data_layer.roidb as rdl_roidb
 from data_loader import PascalVOCDataset, KFDataseteval
-from faster_rcnn.fast_rcnn.config import cfg, cfg_from_file
+from packages.config import cfg
 
 try:
     from termcolor import cprint
@@ -25,9 +25,7 @@ def log_print(text, color=None, on_color=None, attrs=None):
 
 # hyper-parameters
 # ------------
-cfg_file = 'experiments/cfgs/faster_rcnn_end2end.yml'
-pretrained_model = 'data/pretrained_model/VGG_imagenet.npy'
-output_dir = 'models/saved_model3'
+output_dir = 'weights'
 
 start_step = 0
 end_step = 100000
@@ -45,7 +43,6 @@ if rand_seed is not None:
     np.random.seed(rand_seed)
 
 # load config
-cfg_from_file(cfg_file)
 lr = cfg.TRAIN.LEARNING_RATE
 momentum = cfg.TRAIN.MOMENTUM
 weight_decay = cfg.TRAIN.WEIGHT_DECAY
@@ -53,9 +50,8 @@ disp_interval = cfg.TRAIN.DISPLAY
 log_interval = cfg.TRAIN.LOG_IMAGE_ITERS
 
 # load net
-net = FasterRCNN(classes=imdb.classes, debug=_DEBUG)
+net = FasterRCNN(classes=cfg.CLASSES, debug=_DEBUG)
 network.weights_normal_init(net, dev=0.01)
-network.load_pretrained_npy(net, pretrained_model)
 
 net.cuda()
 net.train()
@@ -64,8 +60,8 @@ params = list(net.parameters())
 # optimizer = torch.optim.Adam(params[-8:], lr=lr)
 optimizer = torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
 
-trainDataset = KFDataset('train_datasets.th')
-trainDataLoader = DataLoader(trainDataset, config['batch_size'], True)
+trainDataset = PascalVOCDataset('datasets/train_datasets.th')
+trainDataLoader = DataLoader(trainDataset, cfg.TRAIN.IMS_PER_BATCH, True)
 
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
@@ -80,9 +76,9 @@ t.tic()
 for step in range(start_step, end_step+1):
 
     for input_data, gt_boxes, name in trainDataLoader:
+        input_data = input_data.permute(0, 3, 1, 2).float().cuda()
         im_info = input_data.size()
-        gt_boxes = blobs['gt_boxes']
-
+        gt_boxes = gt_boxes.squeeze(0).data.cpu().numpy()
         # forward
         net(input_data, im_info, gt_boxes)
         loss = net.loss + net.rpn.loss
@@ -93,7 +89,7 @@ for step in range(start_step, end_step+1):
             fg += net.fg_cnt
             bg += net.bg_cnt
 
-        train_loss += loss.data[0]
+        train_loss += loss.data.item()
         step_cnt += 1
 
         # backward

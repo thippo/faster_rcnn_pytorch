@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
 import numpy as np
 
 
@@ -82,13 +81,6 @@ def load_pretrained_npy(faster_rcnn_model, fname):
         frcnn_dict[key].copy_(param)
 
 
-def np_to_variable(x, is_cuda=True, dtype=torch.FloatTensor):
-    v = Variable(torch.from_numpy(x).type(dtype))
-    if is_cuda:
-        v = v.cuda()
-    return v
-
-
 def set_trainable(model, requires_grad):
     for param in model.parameters():
         param.requires_grad = requires_grad
@@ -118,4 +110,4 @@ def clip_gradient(model, clip_norm):
     norm = clip_norm / max(totalnorm, clip_norm)
     for p in model.parameters():
         if p.requires_grad:
-            p.grad.mul_(norm)
+            p.grad.mul_(norm.cuda())

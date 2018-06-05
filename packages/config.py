@@ -33,8 +33,10 @@ cfg = __C
 
 # region proposal network (RPN) or not
 __C.IS_RPN = True
+__C.ANCHOR_RATIOS = [0.5, 1, 2]
 __C.ANCHOR_SCALES = [8, 16, 32]
-__C.NCLASSES = 21
+__C.NCLASSES = 2
+__C.CLASSES = ['__background__', 'stomap']
 
 # multiscale training and testing
 __C.IS_MULTISCALE = False
@@ -42,8 +44,6 @@ __C.IS_EXTRAPOLATING = True
 
 __C.REGION_PROPOSAL = 'RPN'
 
-__C.NET_NAME = 'VGGnet'
-__C.SUBCLS_NAME = 'voxel_exemplars'
 
 __C.TRAIN = edict()
 # Adam, Momentum, RMS
@@ -78,13 +78,13 @@ __C.TRAIN.SCALES = (600,)
 __C.TRAIN.MAX_SIZE = 1000
 
 # Images to use per minibatch
-__C.TRAIN.IMS_PER_BATCH = 2
+__C.TRAIN.IMS_PER_BATCH = 1
 
 # Minibatch size (number of regions of interest [ROIs])
-__C.TRAIN.BATCH_SIZE = 128
+__C.TRAIN.BATCH_SIZE = 300
 
 # Fraction of minibatch that is labeled foreground (i.e. class > 0)
-__C.TRAIN.FG_FRACTION = 0.25
+__C.TRAIN.FG_FRACTION = 0.3
 
 # Overlap threshold for a ROI to be considered foreground (if >= FG_THRESH)
 __C.TRAIN.FG_THRESH = 0.5
@@ -92,7 +92,7 @@ __C.TRAIN.FG_THRESH = 0.5
 # Overlap threshold for a ROI to be considered background (class = 0 if
 # overlap in [LO, HI))
 __C.TRAIN.BG_THRESH_HI = 0.5
-__C.TRAIN.BG_THRESH_LO = 0.1
+__C.TRAIN.BG_THRESH_LO = 0.0
 
 # Use horizontally-flipped images during training?
 __C.TRAIN.USE_FLIPPED = True
@@ -123,14 +123,14 @@ __C.TRAIN.BBOX_NORMALIZE_TARGETS = True
 __C.TRAIN.BBOX_INSIDE_WEIGHTS = (1.0, 1.0, 1.0, 1.0)
 # Normalize the targets using "precomputed" (or made up) means and stdevs
 # (BBOX_NORMALIZE_TARGETS must also be True)
-__C.TRAIN.BBOX_NORMALIZE_TARGETS_PRECOMPUTED = True
+__C.TRAIN.BBOX_NORMALIZE_TARGETS_PRECOMPUTED = False
 __C.TRAIN.BBOX_NORMALIZE_MEANS = (0.0, 0.0, 0.0, 0.0)
 __C.TRAIN.BBOX_NORMALIZE_STDS = (0.1, 0.1, 0.2, 0.2)
 # faster rcnn dont use pre-generated rois by selective search
 # __C.TRAIN.BBOX_NORMALIZE_STDS = (1, 1, 1, 1)
 
 # Train using these proposals
-__C.TRAIN.PROPOSAL_METHOD = 'selective_search'
+__C.TRAIN.PROPOSAL_METHOD = 'gt'
 
 # Make minibatches from images that have similar aspect ratios (i.e. both
 # tall and thin or both short and wide) in order to avoid wasting computation
@@ -280,49 +280,6 @@ def get_log_dir(imdb):
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     return log_dir
-
-
-def _merge_a_into_b(a, b):
-    """Merge config dictionary a into config dictionary b, clobbering the
-    options in b whenever they are also specified in a.
-    """
-    if type(a) is not edict:
-        return
-
-    for k, v in a.iteritems():
-        # a must specify keys that are in b
-        if not b.has_key(k):
-            raise KeyError('{} is not a valid config key'.format(k))
-
-        # the types must match, too
-        old_type = type(b[k])
-        if old_type is not type(v):
-            if isinstance(b[k], np.ndarray):
-                v = np.array(v, dtype=b[k].dtype)
-            else:
-                raise ValueError(('Type mismatch ({} vs. {}) '
-                                  'for config key: {}').format(type(b[k]),
-                                                               type(v), k))
-
-        # recursively merge dicts
-        if type(v) is edict:
-            try:
-                _merge_a_into_b(a[k], b[k])
-            except:
-                print('Error under config key: {}'.format(k))
-                raise
-        else:
-            b[k] = v
-
-
-def cfg_from_file(filename):
-    """Load a config file and merge it into the default options."""
-    import yaml
-    with open(filename, 'r') as f:
-        yaml_cfg = edict(yaml.load(f))
-
-    _merge_a_into_b(yaml_cfg, __C)
-
 
 def cfg_from_list(cfg_list):
     """Set config keys via list (e.g., from command line)."""

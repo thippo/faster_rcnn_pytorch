@@ -4,17 +4,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.timer import Timer
-from utils.blob import im_list_to_blob
-from py_cpu_nms import nms
-from rpn_msr.proposal_layer import proposal_layer as proposal_layer_py
-from rpn_msr.anchor_target_layer import anchor_target_layer as anchor_target_layer_py
-from rpn_msr.proposal_target_layer import proposal_target_layer as proposal_target_layer_py
-from fast_rcnn.bbox_transform import bbox_transform_inv, clip_boxes
+from ..utils.timer import Timer
+from ..utils.py_cpu_nms import nms
+from ..rpn_msr.proposal_layer import proposal_layer as proposal_layer_py
+from ..rpn_msr.anchor_target_layer import anchor_target_layer as anchor_target_layer_py
+from ..rpn_msr.proposal_target_layer import proposal_target_layer as proposal_target_layer_py
+from ..utils.bbox_transform import bbox_transform_inv, clip_boxes
 
-import network
-from network import Conv2d, FC
-from resnet import resnet50
+from .network import Conv2d, FC
+from .resnet import resnet18
 
 
 def nms_detections(pred_boxes, scores, nms_thresh, inds=None):
@@ -35,6 +33,7 @@ class ROIpooling(nn.Module):
     def forward(self, features, rois_boxes):
 
         # rois_boxes : [x, y, x`, y`]
+        rois_boxes = rois_boxes[:, 1:]
 
         if type(rois_boxes) == np.ndarray:
             rois_boxes = to_var(torch.from_numpy(rois_boxes))
@@ -61,13 +60,14 @@ class ROIpooling(nn.Module):
         return torch.cat(output, 0)
 
 class RPN(nn.Module):
-    _feat_stride = [16, ]
+    _feat_stride = 16
+    anchor_ratios = [0.5, 1, 2]
     anchor_scales = [8, 16, 32]
 
     def __init__(self):
         super(RPN, self).__init__()
 
-        self.features = resnet50()
+        self.features = resnet18()
         self.conv1 = Conv2d(512, 512, 3, same_padding=True)
         self.score_conv = Conv2d(512, len(self.anchor_scales) * 3 * 2, 1, relu=False, same_padding=False)
         self.bbox_conv = Conv2d(512, len(self.anchor_scales) * 3 * 4, 1, relu=False, same_padding=False)
@@ -81,7 +81,6 @@ class RPN(nn.Module):
         return self.cross_entropy + self.loss_box * 10
 
     def forward(self, im_data, im_info, gt_boxes=None):
-        im_data = im_data.permute(0, 3, 1, 2)
         features = self.features(im_data)
         height, width = features.size()[-2:]
 
@@ -90,7 +89,7 @@ class RPN(nn.Module):
         # rpn score
         rpn_cls_score = self.score_conv(rpn_conv1)
         rpn_cls_score = rpn_cls_score.squeeze(0).permute(1, 2, 0).contiguous().view(-1, 2)
-        rpn_cls_prob = F.softmax(rpn_cls_score_reshape)
+        rpn_cls_prob = F.softmax(rpn_cls_score, dim=1)
         rpn_cls_prob = rpn_cls_prob.view(height, width, 18)
         rpn_cls_prob = rpn_cls_prob.permute(2, 0, 1).contiguous().unsqueeze(0)
 
@@ -99,15 +98,15 @@ class RPN(nn.Module):
 
         # proposal layer
         cfg_key = 'TRAIN' if self.training else 'TEST'
-        rois = self.proposal_layer(rpn_cls_prob_reshape, rpn_bbox_pred, im_info,
-                                   cfg_key, self._feat_stride, self.anchor_scales)
+        rois = self.proposal_layer(rpn_cls_prob, rpn_bbox_pred, im_info,
+                                   cfg_key, self._feat_stride, self.anchor_ratios, self.anchor_scales)
 
         # generating training labels and build the rpn loss
         if self.training:
             assert gt_boxes is not None
-            rpn_data = self.anchor_target_layer(rpn_cls_score, gt_boxes,
-                                                im_info, self._feat_stride, self.anchor_scales)
-            self.cross_entropy, self.loss_box = self.build_loss(rpn_cls_score_reshape, rpn_bbox_pred, rpn_data)
+            rpn_data = self.anchor_target_layer(rpn_cls_prob, gt_boxes,
+                                                im_info, self._feat_stride, self.anchor_ratios, self.anchor_scales)
+            self.cross_entropy, self.loss_box = self.build_loss(rpn_cls_prob, rpn_bbox_pred, rpn_data)
 
         return features, rois
 
@@ -116,16 +115,16 @@ class RPN(nn.Module):
         rpn_cls_score = rpn_cls_score_reshape.permute(0, 2, 3, 1).contiguous().view(-1, 2)
         rpn_label = rpn_data[0].view(-1)
 
-        rpn_keep = Variable(rpn_label.data.ne(-1).nonzero().squeeze()).cuda()
+        rpn_keep = rpn_label.data.ne(-1).nonzero().squeeze().cuda()
         rpn_cls_score = torch.index_select(rpn_cls_score, 0, rpn_keep)
         rpn_label = torch.index_select(rpn_label, 0, rpn_keep)
 
-        fg_cnt = torch.sum(rpn_label.data.ne(0))
+        fg_cnt = torch.sum(rpn_label.data.ne(0)).float()
 
         rpn_cross_entropy = F.cross_entropy(rpn_cls_score, rpn_label)
 
         # box loss
-        rpn_bbox_targets, rpn_bbox_inside_weights, rpn_bbox_outside_weights = rpn_data[1:]
+        rpn_bbox_targets, rpn_bbox_inside_weights = rpn_data[1:]
         rpn_bbox_targets = torch.mul(rpn_bbox_targets, rpn_bbox_inside_weights)
         rpn_bbox_pred = torch.mul(rpn_bbox_pred, rpn_bbox_inside_weights)
 
@@ -135,15 +134,15 @@ class RPN(nn.Module):
 
 
     @staticmethod
-    def proposal_layer(rpn_cls_prob_reshape, rpn_bbox_pred, im_info, cfg_key, _feat_stride, anchor_scales):
+    def proposal_layer(rpn_cls_prob_reshape, rpn_bbox_pred, im_info, cfg_key, _feat_stride, anchor_ratios, anchor_scales):
         rpn_cls_prob_reshape = rpn_cls_prob_reshape.data.cpu().numpy()
         rpn_bbox_pred = rpn_bbox_pred.data.cpu().numpy()
-        x = proposal_layer_py(rpn_cls_prob_reshape, rpn_bbox_pred, im_info, cfg_key, _feat_stride, anchor_scales)
-        x = network.np_to_variable(x, is_cuda=True)
+        x = proposal_layer_py(rpn_cls_prob_reshape, rpn_bbox_pred, im_info, cfg_key, _feat_stride, anchor_ratios, anchor_scales)
+        x = torch.from_numpy(x).cuda()
         return x.view(-1, 5)
 
     @staticmethod
-    def anchor_target_layer(rpn_cls_score, gt_boxes, im_info, _feat_stride, anchor_scales):
+    def anchor_target_layer(rpn_cls_score, gt_boxes, im_info, _feat_stride, anchor_ratios, anchor_scales):
         """
         rpn_cls_score: for pytorch (1, Ax2, H, W) bg/fg scores of previous conv layer
         gt_boxes: (G, 5) vstack of [x1, y1, x2, y2, class]
@@ -159,19 +158,17 @@ class RPN(nn.Module):
         rpn_bbox_targets: (1, 4xA, H, W), distances of the anchors to the gt_boxes(may contains some transform)
                         that are the regression objectives
         rpn_bbox_inside_weights: (1, 4xA, H, W) weights of each boxes, mainly accepts hyper param in cfg
-        rpn_bbox_outside_weights: (1, 4xA, H, W) used to balance the fg/bg,
         beacuse the numbers of bgs and fgs mays significiantly different
         """
         rpn_cls_score = rpn_cls_score.data.cpu().numpy()
-        rpn_labels, rpn_bbox_targets, rpn_bbox_inside_weights, rpn_bbox_outside_weights = \
-            anchor_target_layer_py(rpn_cls_score, gt_boxes, gt_ishard, dontcare_areas, im_info, _feat_stride, anchor_scales)
+        rpn_labels, rpn_bbox_targets, rpn_bbox_inside_weights = \
+            anchor_target_layer_py(rpn_cls_score, gt_boxes, im_info, _feat_stride, anchor_ratios, anchor_scales)
 
-        rpn_labels = network.np_to_variable(rpn_labels, is_cuda=True, dtype=torch.LongTensor)
-        rpn_bbox_targets = network.np_to_variable(rpn_bbox_targets, is_cuda=True)
-        rpn_bbox_inside_weights = network.np_to_variable(rpn_bbox_inside_weights, is_cuda=True)
-        rpn_bbox_outside_weights = network.np_to_variable(rpn_bbox_outside_weights, is_cuda=True)
+        rpn_labels = torch.from_numpy(rpn_labels).long().cuda()
+        rpn_bbox_targets = torch.from_numpy(rpn_bbox_targets).cuda()
+        rpn_bbox_inside_weights = torch.from_numpy(rpn_bbox_inside_weights).cuda()
 
-        return rpn_labels, rpn_bbox_targets, rpn_bbox_inside_weights, rpn_bbox_outside_weights
+        return rpn_labels, rpn_bbox_targets, rpn_bbox_inside_weights
 
 class FasterRCNN(nn.Module):
 
@@ -215,7 +212,7 @@ class FasterRCNN(nn.Module):
         x = F.dropout(x, training=self.training)
 
         cls_score = self.score_fc(x)
-        cls_prob = F.softmax(cls_score)
+        cls_prob = F.softmax(cls_score, dim=1)
         bbox_pred = self.bbox_fc(x)
 
         if self.training:
@@ -238,16 +235,16 @@ class FasterRCNN(nn.Module):
             self.bg_cnt = bg_cnt
 
         ce_weights = torch.ones(cls_score.size()[1])
-        ce_weights[0] = float(fg_cnt) / bg_cnt
+        ce_weights[0] = float(fg_cnt.item()) / bg_cnt.item()
         ce_weights = ce_weights.cuda()
         cross_entropy = F.cross_entropy(cls_score, label, weight=ce_weights)
 
         # bounding box regression L1 loss
-        bbox_targets, bbox_inside_weights, bbox_outside_weights = roi_data[2:]
+        bbox_targets, bbox_inside_weights = roi_data[2:]
         bbox_targets = torch.mul(bbox_targets, bbox_inside_weights)
         bbox_pred = torch.mul(bbox_pred, bbox_inside_weights)
 
-        loss_box = F.smooth_l1_loss(bbox_pred, bbox_targets, size_average=False) / (fg_cnt + 1e-4)
+        loss_box = F.smooth_l1_loss(bbox_pred, bbox_targets, size_average=False) / (fg_cnt.float() + 1e-4)
 
         return cross_entropy, loss_box
 
@@ -270,16 +267,15 @@ class FasterRCNN(nn.Module):
         bbox_outside_weights: (1 x H x W x A, Kx4) 0, 1 masks for the computing loss
         """
         rpn_rois = rpn_rois.data.cpu().numpy()
-        rois, labels, bbox_targets, bbox_inside_weights, bbox_outside_weights = \
+        rois, labels, bbox_targets, bbox_inside_weights = \
             proposal_target_layer_py(rpn_rois, gt_boxes, num_classes)
         # print labels.shape, bbox_targets.shape, bbox_inside_weights.shape
-        rois = network.np_to_variable(rois, is_cuda=True)
-        labels = network.np_to_variable(labels, is_cuda=True, dtype=torch.LongTensor)
-        bbox_targets = network.np_to_variable(bbox_targets, is_cuda=True)
-        bbox_inside_weights = network.np_to_variable(bbox_inside_weights, is_cuda=True)
-        bbox_outside_weights = network.np_to_variable(bbox_outside_weights, is_cuda=True)
+        rois = torch.from_numpy(rois).cuda()
+        labels = torch.from_numpy(labels).long().cuda()
+        bbox_targets = torch.from_numpy(bbox_targets).cuda()
+        bbox_inside_weights = torch.from_numpy(bbox_inside_weights).cuda()
 
-        return rois, labels, bbox_targets, bbox_inside_weights, bbox_outside_weights
+        return rois, labels, bbox_targets, bbox_inside_weights
 
     def interpret_faster_rcnn(self, cls_prob, bbox_pred, rois, im_info, im_shape, nms=True, clip=True, min_score=0.0):
         # find class

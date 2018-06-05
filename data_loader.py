@@ -24,9 +24,9 @@ class PascalVOCDataset(Dataset):
 
     def __getitem__(self, item):
 
-        X = np.array(Image.open('images/'+self.train_list[item]+'.jpg')) / 255.
+        X = np.array(Image.open('datasets/images/'+self.train_list[item]+'.jpg')) / 255.
 
-        boxes = self.load_pascal_annotation('annotations/'+self.train_list[item]+'.xml')
+        boxes = self.load_pascal_annotation('datasets/annotations/'+self.train_list[item]+'.xml')
 
         return X, boxes, self.train_list[item]
 
@@ -36,7 +36,7 @@ class PascalVOCDataset(Dataset):
         objs = [x for x in objs if x.find('name').text == 'stomap']
         num_objs = len(objs)
 
-        boxes = np.zeros((num_objs, 4), dtype=np.uint16)
+        boxes = np.zeros((num_objs, 5))
 		
         # Load object bounding boxes into a data frame.
         for ix, obj in enumerate(objs):
@@ -46,7 +46,7 @@ class PascalVOCDataset(Dataset):
             y1 = float(bbox.find('ymin').text) - 1
             x2 = float(bbox.find('xmax').text) - 1
             y2 = float(bbox.find('ymax').text) - 1
-            boxes[ix, :] = [x1, y1, x2, y2]
+            boxes[ix, :] = [x1, y1, x2, y2, 1]
 
         return boxes
 

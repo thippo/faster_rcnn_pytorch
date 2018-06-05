@@ -6,17 +6,14 @@
 # --------------------------------------------------------
 
 import numpy as np
-import yaml
 
 from .generate_anchors import generate_anchors
 
 # TODO: make fast_rcnn irrelevant
 # >>>> obsolete, because it depends on sth outside of this project
-from ..fast_rcnn.config import cfg
-from ..fast_rcnn.bbox_transform import bbox_transform_inv, clip_boxes
-from ..fast_rcnn.nms_wrapper import nms
-
-# <<<< obsolete
+from ..config import cfg
+from ..utils.bbox_transform import bbox_transform_inv, clip_boxes
+from ..utils.py_cpu_nms import nms
 
 
 DEBUG = False
@@ -26,8 +23,8 @@ transformations to a set of regular boxes (called "anchors").
 """
 
 
-def proposal_layer(rpn_cls_prob_reshape, rpn_bbox_pred, im_info, cfg_key, _feat_stride=[16, ],
-                   anchor_scales=[8, 16, 32]):
+def proposal_layer(rpn_cls_prob_reshape, rpn_bbox_pred, im_info, cfg_key, _feat_stride,
+                   anchor_ratios, anchor_scales):
     """
     Parameters
     ----------
@@ -58,14 +55,13 @@ def proposal_layer(rpn_cls_prob_reshape, rpn_bbox_pred, im_info, cfg_key, _feat_
     #layer_params = yaml.load(self.param_str_)
 
     """
-    _anchors = generate_anchors(scales=np.array(anchor_scales))
+    _anchors = generate_anchors(base_size=_feat_stride, ratios=anchor_ratios, scales=np.array(anchor_scales))
     _num_anchors = _anchors.shape[0]
     # rpn_cls_prob_reshape = np.transpose(rpn_cls_prob_reshape,[0,3,1,2]) #-> (1 , 2xA, H , W)
     # rpn_bbox_pred = np.transpose(rpn_bbox_pred,[0,3,1,2])              # -> (1 , Ax4, H , W)
 
     # rpn_cls_prob_reshape = np.transpose(np.reshape(rpn_cls_prob_reshape,[1,rpn_cls_prob_reshape.shape[0],rpn_cls_prob_reshape.shape[1],rpn_cls_prob_reshape.shape[2]]),[0,3,2,1])
     # rpn_bbox_pred = np.transpose(rpn_bbox_pred,[0,3,2,1])
-    im_info = im_info[0]
 
     assert rpn_cls_prob_reshape.shape[0] == 1, \
         'Only single item batches are supported'
@@ -83,14 +79,13 @@ def proposal_layer(rpn_cls_prob_reshape, rpn_bbox_pred, im_info, cfg_key, _feat_
     # im_info = bottom[2].data[0, :]
 
     if DEBUG:
-        print 'im_size: ({}, {})'.format(im_info[0], im_info[1])
-        print 'scale: {}'.format(im_info[2])
+        print('im_size: ({}, {})'.format(im_info[2], im_info[3]))
 
     # 1. Generate proposals from bbox deltas and shifted anchors
     height, width = scores.shape[-2:]
 
     if DEBUG:
-        print 'score map size: {}'.format(scores.shape)
+        print('score map size: {}'.format(scores.shape))
 
     # Enumerate all shifts
     shift_x = np.arange(0, width) * _feat_stride
@@ -131,11 +126,11 @@ def proposal_layer(rpn_cls_prob_reshape, rpn_bbox_pred, im_info, cfg_key, _feat_
     proposals = bbox_transform_inv(anchors, bbox_deltas)
 
     # 2. clip predicted boxes to image
-    proposals = clip_boxes(proposals, im_info[:2])
+    proposals = clip_boxes(proposals, im_info[2:])
 
     # 3. remove predicted boxes with either height or width < threshold
     # (NOTE: convert min_size to input image scale stored in im_info[2])
-    keep = _filter_boxes(proposals, min_size * im_info[2])
+    keep = _filter_boxes(proposals, min_size)
     proposals = proposals[keep, :]
     scores = scores[keep]
 
